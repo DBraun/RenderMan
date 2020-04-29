@@ -44,6 +44,17 @@ namespace wrap
     	return list;
     }
 
+    // Converts a C++ vector to a python list
+    template <class T>
+    boost::python::list toPythonList(std::vector<T> vector) {
+        typename std::vector<T>::iterator iter;
+        boost::python::list list;
+        for (iter = vector.begin(); iter != vector.end(); ++iter) {
+            list.append(*iter);
+        }
+        return list;
+    }
+
     //==========================================================================
     // Converts a std::pair which is used as a parameter in C++
     // into a tuple with the respective types int and float for
@@ -72,20 +83,6 @@ namespace wrap
     }
 
     //==========================================================================
-    // std::vector <std::array <double, 13>> MFCCFeatures;
-    boost::python::list mfccFramesToListOfLists (MFCCFeatures frames)
-    {
-        boost::python::list list;
-        std::vector <std::array <double, 13>>::iterator iter;
-        for (iter = frames.begin(); iter != frames.end(); ++iter)
-        {
-            auto l = arrayToList (*iter);
-    		list.append(l);
-    	}
-    	return list;
-    }
-
-    //==========================================================================
     PluginPatch listOfTuplesToPluginPatch (boost::python::list listOfTuples)
     {
         PluginPatch patch;
@@ -109,8 +106,8 @@ namespace wrap
     {
     public:
 
-        RenderEngineWrapper (int sr, int bs, int ffts) :
-            RenderEngine (sr, bs, ffts)
+        RenderEngineWrapper (int sr, int bs) :
+            RenderEngine (sr, bs)
         { }
 
 		RenderEngineWrapper(const RenderEngineWrapper&) {
@@ -127,64 +124,36 @@ namespace wrap
         {
             return pluginPatchToListOfTuples (RenderEngine::getPatch());
         }
-
-        void wrapperRenderPatch (int    midiNote,
-                                 int    midiVelocity,
-                                 double noteLength,
-                                 double renderLength)
+        
+        float wrapperGetParameter (int parameter)
         {
-            if (midiNote > 255) midiNote = 255;
-            if (midiNote < 0) midiNote = 0;
-            if (midiVelocity > 255) midiVelocity = 255;
-            if (midiVelocity < 0) midiVelocity = 0;
-            RenderEngine::renderPatch(midiNote,
-                                      midiVelocity,
-                                      noteLength,
-                                      renderLength);
+            return RenderEngine::getParameter(parameter);
         }
 
-        boost::python::list wrapperGetMFCCFrames()
+        void wrapperSetParameter (int parameter, float value)
         {
-            return mfccFramesToListOfLists (RenderEngine::getMFCCFrames());
+            RenderEngine::setParameter(parameter, value);
         }
-
+        
         int wrapperGetPluginParameterSize()
         {
             return int (RenderEngine::getPluginParameterSize());
         }
 
-        std::string wrapperGetPluginParametersDescription()
-        {
-            return RenderEngine::getPluginParametersDescription().toStdString();
-        }
-
         boost::python::list wrapperGetAudioFrames()
         {
-            return vectorToList (RenderEngine::getAudioFrames());
+            std::vector<std::vector<double>> channelBuffers = RenderEngine::getAudioFrames();
+            boost::python::list list;
+            for (auto oneBuffer = channelBuffers.begin(); oneBuffer != channelBuffers.end(); ++oneBuffer)
+            {
+                list.append(vectorToList(*oneBuffer));
+            }
+            return list;
         }
 
         boost::python::list wrapperGetRMSFrames()
         {
             return vectorToList (RenderEngine::getRMSFrames());
-        }
-    };
-
-    //==========================================================================
-    class PatchGeneratorWrapper : public PatchGenerator
-    {
-    public:
-        PatchGeneratorWrapper (RenderEngine& engine) :
-            PatchGenerator (engine)
-        { }
-
-        boost::python::tuple wrapperGetRandomParameter (int index)
-        {
-            return parameterToTuple (PatchGenerator::getRandomParameter (index));
-        }
-
-        boost::python::list wrapperGetRandomPatch()
-        {
-            return pluginPatchToListOfTuples (PatchGenerator::getRandomPatch());
         }
     };
 }
@@ -195,21 +164,25 @@ BOOST_PYTHON_MODULE(librenderman)
     using namespace boost::python;
     using namespace wrap;
 
-    class_<RenderEngineWrapper>("RenderEngine", init<int, int, int>())
+    class_<RenderEngineWrapper>("RenderEngine", init<int, int>())
+    .def("hello", &RenderEngineWrapper::hello)
+    .def("n_midi_events", &RenderEngineWrapper::nMidiEvents)
+    .def("load_preset", &RenderEngineWrapper::loadPreset)
     .def("load_plugin", &RenderEngineWrapper::loadPlugin)
-    .def("set_patch", &RenderEngineWrapper::wrapperSetPatch)
+    .def("load_midi", &RenderEngineWrapper::loadMidi)
+    .def("clear_midi", &RenderEngineWrapper::clearMidi)
+    .def("add_midi_note", &RenderEngineWrapper::addMidiNote)
     .def("get_patch", &RenderEngineWrapper::wrapperGetPatch)
-    .def("render_patch", &RenderEngineWrapper::wrapperRenderPatch)
-    .def("get_mfcc_frames", &RenderEngineWrapper::wrapperGetMFCCFrames)
+    .def("set_patch", &RenderEngineWrapper::wrapperSetPatch)
+    .def("get_parameter", &RenderEngineWrapper::wrapperGetParameter)
+    .def("get_parameter_text", &RenderEngineWrapper::getParameterAsText)
+    .def("set_parameter", &RenderEngineWrapper::wrapperSetParameter)
+    .def("render", &RenderEngineWrapper::render)
     .def("get_plugin_parameter_size", &RenderEngineWrapper::wrapperGetPluginParameterSize)
-    .def("get_plugin_parameters_description", &RenderEngineWrapper::wrapperGetPluginParametersDescription)
+    .def("get_plugin_parameters_description", &RenderEngineWrapper::getPluginParametersDescription)
     .def("override_plugin_parameter", &RenderEngineWrapper::overridePluginParameter)
     .def("remove_overriden_plugin_parameter", &RenderEngineWrapper::removeOverridenParameter)
     .def("get_audio_frames", &RenderEngineWrapper::wrapperGetAudioFrames)
     .def("get_rms_frames", &RenderEngineWrapper::wrapperGetRMSFrames)
     .def("write_to_wav", &RenderEngineWrapper::writeToWav);
-
-    class_<PatchGeneratorWrapper>("PatchGenerator", init<RenderEngineWrapper&>())
-    .def("get_random_parameter", &PatchGeneratorWrapper::wrapperGetRandomParameter)
-    .def("get_random_patch", &PatchGeneratorWrapper::wrapperGetRandomPatch);
 }

@@ -17,24 +17,20 @@
 #include <sstream>
 #include <string>
 #include "Maximilian/maximilian.h"
-#include "Maximilian/libs/maxiFFT.h"
-#include "Maximilian/libs/maxiMFCC.h"
 #include "../JuceLibraryCode/JuceHeader.h"
+#include <boost/python.hpp>
 
 using namespace juce;
 
 typedef std::vector<std::pair<int, float>>  PluginPatch;
-typedef std::vector<std::array<double, 13>> MFCCFeatures;
 
 class RenderEngine
 {
 public:
     RenderEngine (int sr=44100,
-                  int bs=512,
-                  int ffts=512) :
+                  int bs=512) :
         sampleRate(sr),
         bufferSize(bs),
-        fftSize(ffts),
         plugin(nullptr)
     {
         maxiSettings::setup (sampleRate, 1, bufferSize);
@@ -51,42 +47,58 @@ public:
 
 	RenderEngine(RenderEngine&) = default;
 
+    bool loadPreset (const std::string& path);
 
     bool loadPlugin (const std::string& path);
+    
+    int nMidiEvents () {
+        return midiBuffer.getNumEvents();
+    };
+
+    bool loadMidi (const std::string& path);
 
     void setPatch (const PluginPatch patch);
 
+    float getParameter (const int parameter);
+
+    std::string getParameterAsText(const int parameter);
+
+    void setParameter (const int parameter, const float value);
+
     const PluginPatch getPatch();
+    
+    void clearMidi();
 
-    void renderPatch (const uint8  midiNote,
+    bool addMidiNote(const uint8  midiNote,
                       const uint8  midiVelocity,
-                      const double noteLength,
-                      const double renderLength);
+                      const double noteStart,
+                      const double noteLength);
 
-    const MFCCFeatures getMFCCFrames();
+    int hello () {
+        DBG("hello");
+        return 1;
+    }
 
-    const MFCCFeatures getNormalisedMFCCFrames (const std::array<double, 13>& mean,
-                                                const std::array<double, 13>& variance);
+    void render (const double renderLength);
 
     const std::vector<double> getRMSFrames();
 
     const size_t getPluginParameterSize();
 
-    const String getPluginParametersDescription();
+    boost::python::list getPluginParametersDescription();
 
     bool overridePluginParameter (const int   index,
                                   const float value);
 
     bool removeOverridenParameter (const int index);
 
-    const std::vector<double> getAudioFrames();
+    const std::vector<std::vector<double>> getAudioFrames();
 
     bool writeToWav(const std::string& path);
 
 private:
-    void fillAudioFeatures (const AudioSampleBuffer& data,
-                            maxiFFT&                 fft);
-
+    void fillAudioFeatures (const AudioSampleBuffer& data);
+    
     void ifTimeSetNoteOff (const double& noteLength,
                            const double& sampleRate,
                            const int&    bufferSize,
@@ -95,18 +107,20 @@ private:
                            const uint8&  midiVelocity,
                            const int&    currentBufferIndex,
                            MidiBuffer&   bufferToNoteOff);
-
+                           
     void fillAvailablePluginParameters (PluginPatch& params);
+
+
+    MidiFile             midiData;
+    MidiBuffer           midiBuffer;
 
     double               sampleRate;
     int                  bufferSize;
-    int                  fftSize;
-    maxiMFCC             mfcc;
 	std::unique_ptr<juce::AudioPluginInstance, std::default_delete<juce::AudioPluginInstance>> plugin;
     PluginPatch          pluginParameters;
     PluginPatch          overridenParameters;
-    MFCCFeatures         mfccFeatures;
-    std::vector<double>  processedMonoAudioPreview;
+    std::vector<double>  processedAudioPreviewLeft;
+    std::vector<double>  processedAudioPreviewRight;
     std::vector<double>  rmsFrames;
     double               currentRmsFrame = 0;
 };

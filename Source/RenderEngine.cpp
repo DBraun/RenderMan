@@ -43,14 +43,13 @@ bool RenderEngine::loadPlugin (const std::string& path)
                                                        sampleRate,
                                                        bufferSize,
                                                        errorMessage);
+
     if (plugin != nullptr)
     {
         // Success so set up plugin, then set up features and get all available
         // parameters from this given plugin.
         plugin->prepareToPlay (sampleRate, bufferSize);
         plugin->setNonRealtime (true);
-
-        mfcc.setup (512, 42, 13, 20, int (sampleRate / 2), sampleRate);
 
         // Resize the pluginParameters patch type to fit this plugin and init
         // all the values to 0.0f!
@@ -66,116 +65,147 @@ bool RenderEngine::loadPlugin (const std::string& path)
     return false;
 }
 
-//==============================================================================
-void RenderEngine::renderPatch (const uint8  midiNote,
-                                const uint8  midiVelocity,
-                                const double noteLength,
-                                const double renderLength)
-{
-    // Get the overriden patch and set the vst parameters with it.
-    PluginPatch overridenPatch = getPatch();
-    for (const auto& parameter : overridenPatch)
-        plugin->setParameter (parameter.first, parameter.second);
 
+bool RenderEngine::loadPreset(const std::string& path)
+{
+    MemoryBlock mb;
+    File file = File(path);
+    file.loadFileAsData(mb);
+    bool loaded = VSTPluginFormat::loadFromFXBFile(plugin.get(), mb.getData(), mb.getSize());
+
+    if (loaded) {
+        for (int i = 0; i < plugin->getNumParameters(); i++) {
+            pluginParameters.at(i) = std::make_pair(i, plugin.get()->getParameter(i));
+        }
+    }    
+
+    return loaded;
+}
+
+bool RenderEngine::loadMidi(const std::string& path)
+{
+    File file = File(path);
+    FileInputStream fileStream(file);
+    MidiFile midiFile;
+    midiFile.readFrom(fileStream);
+    midiFile.convertTimestampTicksToSeconds();
+    midiBuffer.clear();
+    
+    for (int t = 0; t < midiFile.getNumTracks(); t++) {
+        const MidiMessageSequence* track = midiFile.getTrack(t);
+        for (int i = 0; i < track->getNumEvents(); i++) {
+            MidiMessage& m = track->getEventPointer(i)->message;
+            int sampleOffset = (int)(sampleRate * m.getTimeStamp());
+            midiBuffer.addEvent(m, sampleOffset);
+        }
+    }
+    
+    return true;
+}
+
+void RenderEngine::clearMidi() {
+    midiBuffer.clear();
+}
+
+bool RenderEngine::addMidiNote(uint8  midiNote,
+                                uint8  midiVelocity,
+                                const double noteStart,
+                                const double noteLength) {
+    if (midiNote > 255) midiNote = 255;
+    if (midiNote < 0) midiNote = 0;
+    if (midiVelocity > 255) midiVelocity = 255;
+    if (midiVelocity < 0) midiVelocity = 0;
+    if (noteLength <= 0) {
+        return false;   
+    }
+                                    
     // Get the note on midiBuffer.
     MidiMessage onMessage = MidiMessage::noteOn (1,
                                                  midiNote,
                                                  midiVelocity);
-    onMessage.setTimeStamp(0);
-    MidiBuffer midiNoteBuffer;
-    midiNoteBuffer.addEvent (onMessage, onMessage.getTimeStamp());
+    
+    MidiMessage offMessage = MidiMessage::noteOff (1,
+                                                 midiNote,
+                                                 midiVelocity);
+    
+    auto startTime = noteStart * sampleRate;
+    onMessage.setTimeStamp(startTime);
+    offMessage.setTimeStamp(startTime + noteLength * sampleRate);
+    midiBuffer.addEvent (onMessage, onMessage.getTimeStamp());
+    midiBuffer.addEvent (offMessage, offMessage.getTimeStamp());
+    
+    return true;
+}
 
-    // Setup fft here so it is destroyed when rendering is finished and
-    // the stack unwinds so it doesn't share frames with a new patch.
-    maxiFFT fft;
-    fft.setup (fftSize, fftSize / 2, fftSize / 4);
-
+void RenderEngine::render (const double renderLength)
+{
     // Data structure to hold multi-channel audio data.
     AudioSampleBuffer audioBuffer (plugin->getTotalNumOutputChannels(),
                                    bufferSize);
-
+    
     int numberOfBuffers = int (std::ceil (renderLength * sampleRate / bufferSize));
-
+    
     // Clear and reserve memory for the audio storage!
-    processedMonoAudioPreview.clear();
-    processedMonoAudioPreview.reserve (numberOfBuffers * bufferSize);
-
-    // Number of FFT, MFCC and RMS frames.
-    int numberOfFFT = int (std::ceil (renderLength * sampleRate / fftSize)) * 4;
-    rmsFrames.clear();
-    rmsFrames.reserve (numberOfFFT);
-    currentRmsFrame = 0.0;
-    mfccFeatures.clear();
-    mfccFeatures.reserve (numberOfFFT);
-
+    processedAudioPreviewLeft.clear();
+    processedAudioPreviewRight.clear();
+    processedAudioPreviewLeft.reserve (numberOfBuffers * bufferSize);
+    processedAudioPreviewRight.reserve(numberOfBuffers * bufferSize);
+    
     plugin->prepareToPlay (sampleRate, bufferSize);
-
+    
+    MidiBuffer renderMidiBuffer;
+    MidiBuffer::Iterator it(midiBuffer);
+    
+    MidiMessage m;
+    int sampleNumber = -1;
+    bool isMessageBetween;
+    bool bufferRemaining = it.getNextEvent(m, sampleNumber);
+    
     for (int i = 0; i < numberOfBuffers; ++i)
     {
-        // Trigger note off if in the correct audio buffer.
-        ifTimeSetNoteOff (noteLength,
-                          sampleRate,
-                          bufferSize,
-                          1,
-                          midiNote,
-                          midiVelocity,
-                          i,
-                          midiNoteBuffer);
-
+        double start = i * bufferSize;
+        double end = (i + 1) * bufferSize;
+        
+        isMessageBetween = sampleNumber >= start && sampleNumber < end;
+        do {
+            if (isMessageBetween) {
+                renderMidiBuffer.addEvent(m, sampleNumber - start);
+                bufferRemaining = it.getNextEvent(m, sampleNumber);
+                isMessageBetween = sampleNumber >= start && sampleNumber < end;
+            }
+        } while (isMessageBetween && bufferRemaining);
+        
         // Turn Midi to audio via the vst.
-        plugin->processBlock (audioBuffer, midiNoteBuffer);
-
+        plugin->processBlock (audioBuffer, renderMidiBuffer);
+        
         // Get audio features and fill the datastructure.
-        fillAudioFeatures (audioBuffer, fft);
+        fillAudioFeatures (audioBuffer);
     }
 }
 
 //=============================================================================
-void RenderEngine::fillAudioFeatures (const AudioSampleBuffer& data,
-                                      maxiFFT&                 fft)
-{
+void RenderEngine::fillAudioFeatures (const AudioSampleBuffer& data)
+{    
     // Keep it auto as it may or may not be double precision.
     const auto readptrs = data.getArrayOfReadPointers();
     for (int i = 0; i < data.getNumSamples(); ++i)
-    {
+    {        
         // Mono the frame.
-        int channel = 0;
-        auto currentFrame = readptrs[channel][i];
+        auto currentFrameLeft = readptrs[0][i];
+        auto currentFrameRight = currentFrameLeft;
         const int numberChannels = data.getNumChannels();
 
-        while (++channel < numberChannels)
-            currentFrame += readptrs[channel][i];
-
-        currentFrame /= numberChannels;
+        if (numberChannels > 1) {
+            currentFrameRight = readptrs[1][i];
+        }
 
         // Save the audio for playback and plotting!
-        processedMonoAudioPreview.push_back (currentFrame);
-
-        // RMS.
-        currentRmsFrame += (currentFrame * currentFrame);
-
-        // Extract features.
-        if (fft.process (currentFrame))
-        {
-            // This isn't real-time so I can take the luxuary of allocating
-            // heap memory here.
-            double* mfccs = new double[13];
-            mfcc.mfcc (fft.magnitudes, mfccs);
-
-            std::array<double, 13> mfccsFrame;
-            std::memcpy (mfccsFrame.data(), mfccs, sizeof (double) * 13);
-
-            // Add the mfcc frames here.
-            mfccFeatures.push_back (mfccsFrame);
-            delete[] mfccs;
-
-            // Root Mean Square.
-            currentRmsFrame /= fftSize;
-            currentRmsFrame = sqrt (currentRmsFrame);
-            rmsFrames.push_back (currentRmsFrame);
-            currentRmsFrame = 0.0;
-        }
+        processedAudioPreviewLeft.push_back(currentFrameLeft);
+        processedAudioPreviewRight.push_back(currentFrameRight);
+        
     }
+    
+    
 }
 
 //=============================================================================
@@ -322,26 +352,31 @@ void RenderEngine::fillAvailablePluginParameters (PluginPatch& params)
 }
 
 //==============================================================================
-const String RenderEngine::getPluginParametersDescription()
+boost::python::list RenderEngine::getPluginParametersDescription()
 {
-    String parameterListString ("");
+    boost::python::list myList;
+ 
+    if (plugin != nullptr) {
 
-    if (plugin != nullptr)
-    {
-        std::ostringstream ss;
+        //get the parameters as an AudioProcessorParameter array
+        const Array<AudioProcessorParameter*>& processorParams = plugin->getParameters();
+        for (int i = 0; i < plugin->AudioProcessor::getNumParameters(); i++) {
 
-        for (const auto& pair : pluginParameters)
-        {
-            ss << std::setw (3) << std::setfill (' ') << pair.first;
+            int maximumStringLength = 64;
 
-            const String name = plugin->getParameterName (pair.first);
-            const String index (ss.str());
+            std::string theName = (processorParams[i])->getName(maximumStringLength).toStdString();
+            std::string currentText = processorParams[i]->getText(processorParams[i]->getValue(), maximumStringLength).toStdString();
+            std::string label = processorParams[i]->getLabel().toStdString();
 
-            parameterListString = parameterListString +
-                                  index + ": " + name +
-                                  "\n";
-            ss.str ("");
-            ss.clear();
+            boost::python::dict myDictionary;
+            myDictionary.setdefault("index", i);
+            myDictionary.setdefault("name", theName);
+            myDictionary.setdefault("numSteps", processorParams[i]->getNumSteps());
+            myDictionary.setdefault("isDiscrete", processorParams[i]->isDiscrete());
+            myDictionary.setdefault("label", label);
+            myDictionary.setdefault("text", currentText);
+
+            myList.append(myDictionary);
         }
     }
     else
@@ -349,7 +384,7 @@ const String RenderEngine::getPluginParametersDescription()
         std::cout << "Please load the plugin first!" << std::endl;
     }
 
-    return parameterListString;
+    return myList;
 }
 
 //==============================================================================
@@ -368,6 +403,28 @@ void RenderEngine::setPatch (const PluginPatch patch)
         "\n- Current size:  " << currentParameterSize <<
         "\n- Supplied size: " << newPatchParameterSize << std::endl;
     }
+}
+
+//==============================================================================
+float RenderEngine::getParameter (const int parameter)
+{
+    return plugin->getParameter (parameter);
+}
+
+//==============================================================================
+std::string RenderEngine::getParameterAsText(const int parameter)
+{
+    return plugin->getParameterText(parameter).toStdString();
+}
+
+//==============================================================================
+void RenderEngine::setParameter (const int paramIndex, const float value)
+{
+    plugin->setParameter (paramIndex, value);
+
+    // save the value into the text
+    float actualValue = plugin->getParameter(paramIndex);
+    pluginParameters.at(paramIndex) = std::make_pair(paramIndex, actualValue);
 }
 
 //==============================================================================
@@ -402,33 +459,9 @@ const size_t RenderEngine::getPluginParameterSize()
 }
 
 //==============================================================================
-const MFCCFeatures RenderEngine::getMFCCFrames()
+const std::vector<std::vector<double>> RenderEngine::getAudioFrames()
 {
-    return mfccFeatures;
-}
-
-//==============================================================================
-const MFCCFeatures RenderEngine::getNormalisedMFCCFrames(const std::array<double, 13>& mean,
-                                                         const std::array<double, 13>& variance)
-{
-    MFCCFeatures normalisedMFCCFrames;
-    normalisedMFCCFrames.resize (mfccFeatures.size());
-
-    for (size_t i = 0; i < normalisedMFCCFrames.size(); ++i)
-    {
-        for (size_t j = 0; j < 13; ++j)
-        {
-            normalisedMFCCFrames[i][j] = mfccFeatures[i][j] - mean[j];
-            normalisedMFCCFrames[i][j] /= variance[j];
-        }
-    }
-    return normalisedMFCCFrames;
-}
-
-//==============================================================================
-const std::vector<double> RenderEngine::getAudioFrames()
-{
-    return processedMonoAudioPreview;
+    return { processedAudioPreviewLeft, processedAudioPreviewRight };
 }
 
 //==============================================================================
@@ -440,14 +473,14 @@ const std::vector<double> RenderEngine::getRMSFrames()
 //==============================================================================
 bool RenderEngine::writeToWav(const std::string& path)
 {
-    const auto size = processedMonoAudioPreview.size();
+    const auto size = processedAudioPreviewLeft.size();
     if (size == 0)
         return false;
 
     maxiRecorder recorder;
     recorder.setup (path);
     recorder.startRecording();
-    const double* data = processedMonoAudioPreview.data();
+    const double* data = processedAudioPreviewLeft.data();
     recorder.passData (data, size);
     recorder.stopRecording();
     recorder.saveToWav();
